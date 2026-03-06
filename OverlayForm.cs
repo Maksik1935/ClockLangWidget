@@ -1,4 +1,4 @@
-﻿﻿using System;
+﻿using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -43,6 +43,10 @@ internal sealed class OverlayForm : Form
     private int _shellHookMsg;
     private bool _shellHookRegistered;
 
+    // AppBar callback (ABN_FULLSCREENAPP)
+    private int _appBarCallbackMsg;
+    private bool _appBarRegistered;
+
     // Low-level keyboard hook (ловим попытку переключения раскладки хоткеями)
     private IntPtr _kbdHook = IntPtr.Zero;
     private LowLevelKeyboardProc? _kbdProc;
@@ -57,6 +61,7 @@ internal sealed class OverlayForm : Form
 
     // Hover hide state
     private bool _hiddenByHover;
+    private bool _hiddenByFullscreen;
     private int _hoverOutTicks;
 
     // Какие хоткеи реально отслеживать (можем сузить по настройкам Windows)
@@ -182,6 +187,10 @@ internal sealed class OverlayForm : Form
         _shellHookMsg = RegisterWindowMessage("SHELLHOOK");
         _shellHookRegistered = RegisterShellHookWindow(Handle);
 
+        // AppBar callback: ловим старт/окончание полноэкранных приложений
+        _appBarCallbackMsg = RegisterWindowMessage("ClockLangWidget.AppBarCallback");
+        RegisterAppBarCallback();
+
         // Low-level keyboard hook
         _kbdProc = KeyboardHookProc;
         _kbdHook = InstallKeyboardHook(_kbdProc);
@@ -204,6 +213,21 @@ internal sealed class OverlayForm : Form
     {
         base.OnShown(e);
         RefreshAll(force: true);
+    }
+
+    protected override void OnHandleDestroyed(EventArgs e)
+    {
+        try { UnregisterAppBarCallback(); } catch { }
+
+        if (_shellHookRegistered)
+        {
+            try { DeregisterShellHookWindow(Handle); } catch { }
+            _shellHookRegistered = false;
+        }
+
+        _hwnd = IntPtr.Zero;
+
+        base.OnHandleDestroyed(e);
     }
 
     protected override void WndProc(ref Message m)
@@ -229,12 +253,19 @@ internal sealed class OverlayForm : Form
             m.Result = (IntPtr)HTTRANSPARENT;
 
             // скрываем только если видимы и реально под курсором
-            if (!_hiddenByHover && Visible)
+            if (!_hiddenByFullscreen && !_hiddenByHover && Visible)
             {
                 if (Bounds.Contains(Cursor.Position))
                     StartFadeTo(0, hideWhenDone: true);
             }
-            m.Result = (IntPtr)HTTRANSPARENT;
+            return;
+        }
+
+        // AppBar callback: появилось/пропало полноэкранное приложение
+        if (_appBarCallbackMsg != 0 && m.Msg == _appBarCallbackMsg)
+        {
+            if (m.WParam.ToInt32() == ABN_FULLSCREENAPP)
+                OnFullscreenAppNotification(m.LParam != IntPtr.Zero);
             return;
         }
 
@@ -285,6 +316,12 @@ internal sealed class OverlayForm : Form
 
     private void HoverTick()
     {
+        if (_hiddenByFullscreen)
+        {
+            _hoverTimer.Stop();
+            return;
+        }
+
         if (!_hiddenByHover)
         {
             _hoverTimer.Stop();
@@ -314,15 +351,59 @@ internal sealed class OverlayForm : Form
         RefreshBattery();          // если батарейка рисуется — тоже актуализируй
         RenderIfNeeded(force: false); // обновит _cachedHBitmap
 
-        StartFadeTo(255, hideWhenDone: false);
-
         // ВАЖНО: плавно показываем (а не Show+Render с alpha=0)
         StartFadeTo(255, hideWhenDone: false);
+    }
+
+    private void OnFullscreenAppNotification(bool hasFullscreenApp)
+    {
+        if (IsDisposed || Disposing) return;
+
+        if (hasFullscreenApp)
+        {
+            _hiddenByFullscreen = true;
+            _hiddenByHover = false;
+            _hoverOutTicks = 0;
+
+            _hoverTimer.Stop();
+            _fadeTimer.Stop();
+            _fading = false;
+
+            if (Visible)
+                Hide();
+            return;
+        }
+
+        if (!_hiddenByFullscreen)
+            return;
+
+        _hiddenByFullscreen = false;
+        _hiddenByHover = false;
+        _hoverOutTicks = 0;
+
+        _hoverTimer.Stop();
+        _fadeTimer.Stop();
+        _fading = false;
+
+        var now = DateTime.Now;
+        _timeText = now.ToString("HH:mm");
+        _dateText = now.ToString("dd.MM.yyyy");
+        _langText = GetActiveKeyboardLayoutShort();
+        RefreshBattery();
+
+        _globalAlpha = 255;
+
+        if (!Visible)
+            Show();
+
+        RenderIfNeeded(force: true);
+        EnsureBehindTaskbar();
     }
 
     private void StartFadeTo(byte targetAlpha, bool hideWhenDone)
     {
         if (IsDisposed || Disposing) return;
+        if (_hiddenByFullscreen) return;
 
         // если уже в нужном состоянии — ничего
         if (!_fading && _globalAlpha == targetAlpha) return;
@@ -450,10 +531,41 @@ internal sealed class OverlayForm : Form
     private void RenderOnly(bool force)
     {
         if (IsDisposed || Disposing) return;
-        if (_hiddenByHover) return; // пока скрыты — не тратим CPU на UpdateLayered
+        if (_hiddenByHover || _hiddenByFullscreen) return; // пока скрыты — не тратим CPU на UpdateLayered
 
         RenderIfNeeded(force);
         EnsureBehindTaskbar();
+    }
+
+    private void RegisterAppBarCallback()
+    {
+        if (!IsHandleCreated) return;
+        if (_appBarRegistered) return;
+        if (_appBarCallbackMsg == 0) return;
+
+        var abd = new APPBARDATA
+        {
+            cbSize = (uint)Marshal.SizeOf<APPBARDATA>(),
+            hWnd = Handle,
+            uCallbackMessage = (uint)_appBarCallbackMsg
+        };
+
+        _appBarRegistered = SHAppBarMessage(ABM_NEW, ref abd) != IntPtr.Zero;
+    }
+
+    private void UnregisterAppBarCallback()
+    {
+        if (!_appBarRegistered) return;
+        if (!IsHandleCreated) return;
+
+        var abd = new APPBARDATA
+        {
+            cbSize = (uint)Marshal.SizeOf<APPBARDATA>(),
+            hWnd = Handle
+        };
+
+        SHAppBarMessage(ABM_REMOVE, ref abd);
+        _appBarRegistered = false;
     }
 
     // --- Power callback (plug/unplug etc.) ---
@@ -898,6 +1010,8 @@ internal sealed class OverlayForm : Form
             try { _hoverTimer.Stop(); _hoverTimer.Dispose(); } catch { }
             try { _fadeTimer.Stop(); _fadeTimer.Dispose(); } catch { }
 
+            try { UnregisterAppBarCallback(); } catch { }
+
             // Сначала делаем hwnd недоступным для hook’а
             _hwnd = IntPtr.Zero;
 
@@ -1106,43 +1220,6 @@ internal sealed class OverlayForm : Form
         }
     }
 
-    private void SetLayeredBitmap(Bitmap bmp, Point screenPos, byte alpha)
-    {
-        IntPtr screenDc = GetDC(IntPtr.Zero);
-        IntPtr memDc = CreateCompatibleDC(screenDc);
-
-        IntPtr hBitmap = IntPtr.Zero;
-        IntPtr oldBitmap = IntPtr.Zero;
-
-        try
-        {
-            hBitmap = bmp.GetHbitmap(Color.FromArgb(0));
-            oldBitmap = SelectObject(memDc, hBitmap);
-
-            var size = new SIZE(bmp.Width, bmp.Height);
-            var src = new POINT(0, 0);
-            var dst = new POINT(screenPos.X, screenPos.Y);
-
-            var blend = new BLENDFUNCTION
-            {
-                BlendOp = AC_SRC_OVER,
-                BlendFlags = 0,
-                SourceConstantAlpha = alpha,   // <-- ВАЖНО
-                AlphaFormat = AC_SRC_ALPHA
-            };
-
-            UpdateLayeredWindow(Handle, screenDc, ref dst, ref size, memDc, ref src, 0, ref blend, ULW_ALPHA);
-        }
-        finally
-        {
-            if (oldBitmap != IntPtr.Zero) SelectObject(memDc, oldBitmap);
-            if (hBitmap != IntPtr.Zero) DeleteObject(hBitmap);
-
-            DeleteDC(memDc);
-            ReleaseDC(IntPtr.Zero, screenDc);
-        }
-    }
-
     private void SetLayeredHBitmap(IntPtr hBitmap, SIZE size, Point screenPos, byte alpha)
     {
         if (hBitmap == IntPtr.Zero) return;
@@ -1326,6 +1403,11 @@ internal sealed class OverlayForm : Form
     private const int HSHELL_WINDOWACTIVATED = 4;
     private const int HSHELL_RUDEAPPACTIVATED = 0x8004;
 
+    // AppBar
+    private const int ABM_NEW = 0x00000000;
+    private const int ABM_REMOVE = 0x00000001;
+    private const int ABN_FULLSCREENAPP = 0x00000002;
+
     // Low-level keyboard
     private const int WH_KEYBOARD_LL = 13;
     private const int WM_KEYUP = 0x0101;
@@ -1349,6 +1431,9 @@ internal sealed class OverlayForm : Form
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int RegisterWindowMessage(string lpString);
+
+    [DllImport("shell32.dll", SetLastError = true)]
+    private static extern IntPtr SHAppBarMessage(int dwMessage, ref APPBARDATA pData);
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr FindWindow(string lpClassName, string? lpWindowName);
@@ -1437,6 +1522,17 @@ internal sealed class OverlayForm : Form
         public byte SystemStatusFlag;
         public int BatteryLifeTime;
         public int BatteryFullLifeTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct APPBARDATA
+    {
+        public uint cbSize;
+        public IntPtr hWnd;
+        public uint uCallbackMessage;
+        public uint uEdge;
+        public RECT rc;
+        public IntPtr lParam;
     }
 
     [StructLayout(LayoutKind.Sequential)]
