@@ -1,0 +1,2 @@
+﻿Собрал командой dotnet publish ClockLangWidget.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true (поставь dotned и sdk)
+Автозапуск - Win+R -> shell:startup. Откроется папка, туда просто положи .exe
