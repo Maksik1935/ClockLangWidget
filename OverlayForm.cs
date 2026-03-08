@@ -316,8 +316,8 @@ internal sealed partial class OverlayForm : Form
 
     private void MinuteTimerTick(object? sender, EventArgs e)
     {
-        _minuteTimer.Stop();          // важно: один тик -> один пересчёт
-        RefreshMinuteTick();          // твой код обновления текста + RenderOnly
+        _minuteTimer.Stop();          // один тик -> один пересчёт
+        RefreshMinuteTick();          // код обновления текста + RenderOnly
         ScheduleNextMinuteTick();     // снова ровно до следующей минуты
     }
 
@@ -394,11 +394,14 @@ internal sealed partial class OverlayForm : Form
         ResetHoverState();
 
         // ОБЯЗАТЕЛЬНО: обновить содержимое перед показом, иначе покажешь старый кэш
-        UpdateTimeDateAndLanguage(DateTime.Now);
-        RefreshBattery();          // если батарейка рисуется — тоже актуализируй
+        var now = DateTime.Now;
+        _timeText = now.ToString("HH:mm");
+        _dateText = now.ToString("dd.MM.yyyy");
+        _langText = GetActiveKeyboardLayoutShort();
+        RefreshBattery();          // если батарейка рисуется — тоже актуализируем
         RenderIfNeeded(force: false); // обновит _cachedHBitmap
 
-        // ВАЖНО: плавно показываем (а не Show+Render с alpha=0)
+        // плавно показываем
         StartFadeTo(255, hideWhenDone: false);
     }
 
@@ -522,21 +525,6 @@ internal sealed partial class OverlayForm : Form
         UpdateTimeAndDate(DateTime.Now);
 
         // Батарейку в минутном тике НЕ опрашиваем (только по событию)
-        RenderOnly(force: false);
-    }
-
-    private void RefreshLangOnly()
-    {
-        if (IsInactive) return;
-
-        var newLang = GetActiveKeyboardLayoutShort();
-        if (newLang == _langText)
-        {
-            EnsureBehindTaskbar();
-            return;
-        }
-
-        _langText = newLang;
         RenderOnly(force: false);
     }
 
