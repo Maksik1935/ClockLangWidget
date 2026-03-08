@@ -12,10 +12,13 @@ using WinFormsTimer = System.Windows.Forms.Timer;
 
 namespace ClockLangWidget;
 
-internal sealed class OverlayForm : Form
+internal sealed partial class OverlayForm : Form
 {
     // --- Tunables ---
     private const float UiScaleBase = 0.60f;
+    private const string TimeFormat = "HH:mm";
+    private const string DateFormat = "dd.MM.yyyy";
+    private static readonly string[] LangMeasureSamples = { "RU", "EN", "DE" };
 
     // Lang sync: быстрый первый опрос + один ретрай, если не изменилось
     private const int LangSyncDelayFastMs = 100;
@@ -30,6 +33,21 @@ internal sealed class OverlayForm : Form
     // Worst-case строки для расчёта размеров (чтобы не мерить каждый раз)
     private const string MeasureTimeSample = "88:88";
     private const string MeasureDateSample = "88.88.8888";
+    private const int MinuteTickSafetyMarginMs = 25;
+    private const int MinMinuteTimerIntervalMs = 250;
+    private const int MaxMinuteTimerIntervalMs = 60_000;
+
+    // Windows message constants
+    private const int WmAppCheckLang = 0x8000 + 0x55;
+    private const int WmDpiChanged = 0x02E0;
+    private const int WmNcHitTest = 0x0084;
+    private const int HtTransparent = -1;
+
+    // SYSTEM_POWER_STATUS constants
+    private const byte AcLineOnlineValue = 1;
+    private const byte NoSystemBatteryFlag = 0x80;
+    private const byte BatteryStateUnknownFlag = 0xFF;
+    private const byte BatteryPercentUnknown = 255;
 
     // --- Runtime state ---
     private readonly WinFormsTimer _minuteTimer;
@@ -37,7 +55,6 @@ internal sealed class OverlayForm : Form
     private readonly WinFormsTimer _hoverTimer;
 
     private IntPtr _taskbarHwnd;
-    private bool _exiting;
 
     // Shell hook (только активация окон)
     private int _shellHookMsg;
@@ -51,7 +68,6 @@ internal sealed class OverlayForm : Form
     private IntPtr _kbdHook = IntPtr.Zero;
     private LowLevelKeyboardProc? _kbdProc;
     private int _langCheckPending; // 0/1 — чтобы не спамить PostMessage
-    private const int WM_APP_CHECK_LANG = 0x8000 + 0x55;
 
     // HWND кешируем отдельно, чтобы из hook’а не трогать Handle при Dispose
     private IntPtr _hwnd = IntPtr.Zero;
@@ -122,6 +138,7 @@ internal sealed class OverlayForm : Form
 
     private IntPtr _cachedHBitmap = IntPtr.Zero;
     private SIZE _cachedSize;
+    private bool IsInactive => IsDisposed || Disposing;
 
     public OverlayForm()
     {
@@ -196,10 +213,7 @@ internal sealed class OverlayForm : Form
         _kbdHook = InstallKeyboardHook(_kbdProc);
 
         // стартовый текст
-        var now = DateTime.Now;
-        _timeText = now.ToString("HH:mm");
-        _dateText = now.ToString("dd.MM.yyyy");
-        _langText = GetActiveKeyboardLayoutShort();
+        UpdateTimeDateAndLanguage(DateTime.Now);
 
         RefreshBattery(); // первичное состояние батареи/AC
 
@@ -232,64 +246,72 @@ internal sealed class OverlayForm : Form
 
     protected override void WndProc(ref Message m)
     {
-        const int WM_DPICHANGED = 0x02E0;
-        const int WM_NCHITTEST = 0x0084;
-        const int HTTRANSPARENT = -1;
-
-        if (m.Msg == WM_DPICHANGED)
-        {
-            base.WndProc(ref m);   // сначала применить suggested rect / внутреннюю логику WinForms
-
-            UpdateScaleFromDpi();
-            RebuildMetricsAndFonts();
-            RecalculateLayoutAndRender(forceRender: true);
-            return;
-        }
-
-        // Hover hide + click-through
-        if (m.Msg == WM_NCHITTEST)
-        {
-            // всегда пропускаем мышь “сквозь”
-            m.Result = (IntPtr)HTTRANSPARENT;
-
-            // скрываем только если видимы и реально под курсором
-            if (!_hiddenByFullscreen && !_hiddenByHover && Visible)
-            {
-                if (Bounds.Contains(Cursor.Position))
-                    StartFadeTo(0, hideWhenDone: true);
-            }
-            return;
-        }
-
-        // AppBar callback: появилось/пропало полноэкранное приложение
-        if (_appBarCallbackMsg != 0 && m.Msg == _appBarCallbackMsg)
-        {
-            if (m.WParam.ToInt32() == ABN_FULLSCREENAPP)
-                OnFullscreenAppNotification(m.LParam != IntPtr.Zero);
-            return;
-        }
-
-        // Shell hook: смена активного окна
-        if (_shellHookMsg != 0 && m.Msg == _shellHookMsg)
-        {
-            int code = m.WParam.ToInt32();
-            if (code == HSHELL_WINDOWACTIVATED || code == HSHELL_RUDEAPPACTIVATED)
-                RequestLangSyncAfterHotkey();
-
-            base.WndProc(ref m);
-            return;
-        }
-
-        // Из keyboard hook: “похоже на переключение раскладки”
-        if (m.Msg == WM_APP_CHECK_LANG)
-        {
-            Interlocked.Exchange(ref _langCheckPending, 0);
-            RequestLangSyncAfterHotkey();
-            base.WndProc(ref m);
-            return;
-        }
+        if (HandleDpiChangedMessage(ref m)) return;
+        if (HandleNcHitTestMessage(ref m)) return;
+        if (HandleAppBarMessage(ref m)) return;
+        if (HandleShellHookMessage(ref m)) return;
+        if (HandleKeyboardLangCheckMessage(ref m)) return;
 
         base.WndProc(ref m);
+    }
+
+    private bool HandleDpiChangedMessage(ref Message message)
+    {
+        if (message.Msg != WmDpiChanged) return false;
+
+        // сначала применить suggested rect / внутреннюю логику WinForms
+        base.WndProc(ref message);
+
+        UpdateScaleFromDpi();
+        RebuildMetricsAndFonts();
+        RecalculateLayoutAndRender(forceRender: true);
+        return true;
+    }
+
+    private bool HandleNcHitTestMessage(ref Message message)
+    {
+        if (message.Msg != WmNcHitTest) return false;
+
+        // всегда пропускаем мышь “сквозь”
+        message.Result = (IntPtr)HtTransparent;
+
+        // скрываем только если видимы и реально под курсором
+        if (!_hiddenByFullscreen && !_hiddenByHover && Visible && Bounds.Contains(Cursor.Position))
+            StartFadeTo(0, hideWhenDone: true);
+
+        return true;
+    }
+
+    private bool HandleAppBarMessage(ref Message message)
+    {
+        if (_appBarCallbackMsg == 0 || message.Msg != _appBarCallbackMsg) return false;
+
+        if (message.WParam.ToInt32() == ABN_FULLSCREENAPP)
+            OnFullscreenAppNotification(message.LParam != IntPtr.Zero);
+
+        return true;
+    }
+
+    private bool HandleShellHookMessage(ref Message message)
+    {
+        if (_shellHookMsg == 0 || message.Msg != _shellHookMsg) return false;
+
+        int code = message.WParam.ToInt32();
+        if (code == HSHELL_WINDOWACTIVATED || code == HSHELL_RUDEAPPACTIVATED)
+            RequestLangSyncAfterHotkey();
+
+        base.WndProc(ref message);
+        return true;
+    }
+
+    private bool HandleKeyboardLangCheckMessage(ref Message message)
+    {
+        if (message.Msg != WmAppCheckLang) return false;
+
+        Interlocked.Exchange(ref _langCheckPending, 0);
+        RequestLangSyncAfterHotkey();
+        base.WndProc(ref message);
+        return true;
     }
 
     private void MinuteTimerTick(object? sender, EventArgs e)
@@ -299,6 +321,35 @@ internal sealed class OverlayForm : Form
         ScheduleNextMinuteTick();     // снова ровно до следующей минуты
     }
 
+    private static string FormatTime(DateTime dateTime) => dateTime.ToString(TimeFormat);
+
+    private static string FormatDate(DateTime dateTime) => dateTime.ToString(DateFormat);
+
+    private void UpdateTimeAndDate(DateTime now)
+    {
+        _timeText = FormatTime(now);
+        _dateText = FormatDate(now);
+    }
+
+    private void UpdateTimeDateAndLanguage(DateTime now)
+    {
+        UpdateTimeAndDate(now);
+        _langText = GetActiveKeyboardLayoutShort();
+    }
+
+    private void StopHoverFadeAnimations()
+    {
+        _hoverTimer.Stop();
+        _fadeTimer.Stop();
+        _fading = false;
+    }
+
+    private void ResetHoverState()
+    {
+        _hiddenByHover = false;
+        _hoverOutTicks = 0;
+    }
+
     private void ComputeLangFixedWidth()
     {
         using var tmp = new Bitmap(1, 1);
@@ -306,7 +357,7 @@ internal sealed class OverlayForm : Form
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
 
         float max = 0;
-        foreach (var s in new[] { "RU", "EN", "DE" })
+        foreach (var s in LangMeasureSamples)
             max = Math.Max(max, g.MeasureString(s, _fontLang!).Width);
 
         _langFixedPx = (int)Math.Ceiling(max);
@@ -340,8 +391,7 @@ internal sealed class OverlayForm : Form
         if (_hoverOutTicks < 1) return;
 
         _hoverTimer.Stop();
-        _hiddenByHover = false;
-        _hoverOutTicks = 0;
+        ResetHoverState();
 
         // ОБЯЗАТЕЛЬНО: обновить содержимое перед показом, иначе покажешь старый кэш
         var now = DateTime.Now;
@@ -357,17 +407,13 @@ internal sealed class OverlayForm : Form
 
     private void OnFullscreenAppNotification(bool hasFullscreenApp)
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
 
         if (hasFullscreenApp)
         {
             _hiddenByFullscreen = true;
-            _hiddenByHover = false;
-            _hoverOutTicks = 0;
-
-            _hoverTimer.Stop();
-            _fadeTimer.Stop();
-            _fading = false;
+            ResetHoverState();
+            StopHoverFadeAnimations();
 
             if (Visible)
                 Hide();
@@ -378,17 +424,10 @@ internal sealed class OverlayForm : Form
             return;
 
         _hiddenByFullscreen = false;
-        _hiddenByHover = false;
-        _hoverOutTicks = 0;
+        ResetHoverState();
+        StopHoverFadeAnimations();
 
-        _hoverTimer.Stop();
-        _fadeTimer.Stop();
-        _fading = false;
-
-        var now = DateTime.Now;
-        _timeText = now.ToString("HH:mm");
-        _dateText = now.ToString("dd.MM.yyyy");
-        _langText = GetActiveKeyboardLayoutShort();
+        UpdateTimeDateAndLanguage(DateTime.Now);
         RefreshBattery();
 
         _globalAlpha = 255;
@@ -402,7 +441,7 @@ internal sealed class OverlayForm : Form
 
     private void StartFadeTo(byte targetAlpha, bool hideWhenDone)
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
         if (_hiddenByFullscreen) return;
 
         // если уже в нужном состоянии — ничего
@@ -481,11 +520,9 @@ internal sealed class OverlayForm : Form
 
     private void RefreshMinuteTick()
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
 
-        var now = DateTime.Now;
-        _timeText = now.ToString("HH:mm");
-        _dateText = now.ToString("dd.MM.yyyy");
+        UpdateTimeAndDate(DateTime.Now);
 
         // Батарейку в минутном тике НЕ опрашиваем (только по событию)
         RenderOnly(force: false);
@@ -493,12 +530,9 @@ internal sealed class OverlayForm : Form
 
     private void RefreshAll(bool force)
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
 
-        var now = DateTime.Now;
-        _timeText = now.ToString("HH:mm");
-        _dateText = now.ToString("dd.MM.yyyy");
-        _langText = GetActiveKeyboardLayoutShort();
+        UpdateTimeDateAndLanguage(DateTime.Now);
 
         bool oldHas = _hasBattery;
         RefreshBattery();
@@ -515,7 +549,7 @@ internal sealed class OverlayForm : Form
 
     private void RenderOnly(bool force)
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
         if (_hiddenByHover || _hiddenByFullscreen) return; // пока скрыты — не тратим CPU на UpdateLayered
 
         RenderIfNeeded(force);
@@ -557,24 +591,21 @@ internal sealed class OverlayForm : Form
 
     private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
 
         // фильтруем, чтобы лишний раз не дёргать UI
         if (e.Mode != PowerModes.StatusChange)
             return;
 
-        if (InvokeRequired)
-        {
-            try { BeginInvoke(new Action(OnPowerModeChangedUi)); } catch { }
+        if (TryBeginInvoke(OnPowerModeChangedUi))
             return;
-        }
 
         OnPowerModeChangedUi();
     }
 
     private void OnPowerModeChangedUi()
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
 
         bool oldHas = _hasBattery;
         bool oldAc = _acOnline;
@@ -596,7 +627,7 @@ internal sealed class OverlayForm : Form
 
     private void RequestLangSyncAfterHotkey()
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
 
         _langSyncAttempt = 0;
         _langSyncTimer.Stop();
@@ -607,7 +638,7 @@ internal sealed class OverlayForm : Form
     private void LangSyncTick()
     {
         _langSyncTimer.Stop();
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
 
         var cur = GetActiveKeyboardLayoutShort();
         if (cur != _langText)
@@ -641,26 +672,26 @@ internal sealed class OverlayForm : Form
         }
 
         // 0x80 = NoSystemBattery, 0xFF = Unknown
-        if (sps.BatteryFlag == 0x80)
+        if (sps.BatteryFlag == NoSystemBatteryFlag)
         {
             _hasBattery = false;
-            _acOnline = (sps.ACLineStatus == 1);
+            _acOnline = sps.ACLineStatus == AcLineOnlineValue;
             _batSteps = 0;
             return;
         }
 
-        if (sps.BatteryFlag == 0xFF)
+        if (sps.BatteryFlag == BatteryStateUnknownFlag)
         {
             // статус батареи неизвестен — не дёргаем _hasBattery/_batSteps, чтобы не мигало
-            _acOnline = (sps.ACLineStatus == 1);
+            _acOnline = sps.ACLineStatus == AcLineOnlineValue;
             return;
         }
 
         _hasBattery = true;
-        _acOnline = (sps.ACLineStatus == 1);
+        _acOnline = sps.ACLineStatus == AcLineOnlineValue;
 
         // проценты могут быть "неизвестно" (255) — тогда оставим прошлое значение
-        if (sps.BatteryLifePercent != 255)
+        if (sps.BatteryLifePercent != BatteryPercentUnknown)
         {
             float p = sps.BatteryLifePercent / 100f;
             if (p < 0) p = 0;
@@ -683,7 +714,7 @@ internal sealed class OverlayForm : Form
 
     private void RecalculateLayoutAndRender(bool forceRender)
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
 
         EnsureTaskbarHandle();
         EnsureSizeForTextWorstCase();
@@ -694,10 +725,15 @@ internal sealed class OverlayForm : Form
 
     // --- Render pipeline ---
 
+    private string BuildRenderKey()
+    {
+        return
+            $"{_scale:F4}|{Width}x{Height}|{Location.X},{Location.Y}|{_langText}|{_timeText}|{_dateText}|BAT:{(_hasBattery ? _batSteps : -1)}|AC:{(_acOnline ? 1 : 0)}|LI:{_leftInsetPx}";
+    }
+
     private void RenderIfNeeded(bool force)
     {
-        string key =
-            $"{_scale:F4}|{Width}x{Height}|{Location.X},{Location.Y}|{_langText}|{_timeText}|{_dateText}|BAT:{(_hasBattery ? _batSteps : -1)}|AC:{(_acOnline ? 1 : 0)}|LI:{_leftInsetPx}";
+        string key = BuildRenderKey();
         if (!force && key == _lastRenderKey)
             return;
 
@@ -889,7 +925,10 @@ internal sealed class OverlayForm : Form
     {
         var now = DateTime.Now;
         var next = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0).AddMinutes(1);
-        int ms = (int)Math.Clamp((next - now).TotalMilliseconds + 25, 250, 60_000);
+        int ms = (int)Math.Clamp(
+            (next - now).TotalMilliseconds + MinuteTickSafetyMarginMs,
+            MinMinuteTimerIntervalMs,
+            MaxMinuteTimerIntervalMs);
 
         _minuteTimer.Interval = ms;
         _minuteTimer.Start();
@@ -957,21 +996,28 @@ internal sealed class OverlayForm : Form
 
     private void OnSystemChanged(object? sender, EventArgs e)
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
 
-        if (InvokeRequired)
-        {
-            try { BeginInvoke(new Action(OnSystemChangedUi)); }
-            catch { }
+        if (TryBeginInvoke(OnSystemChangedUi))
             return;
-        }
 
         OnSystemChangedUi();
     }
 
+    private bool TryBeginInvoke(Action action)
+    {
+        if (!InvokeRequired)
+            return false;
+
+        try { BeginInvoke(action); }
+        catch { }
+
+        return true;
+    }
+
     private void OnSystemChangedUi()
     {
-        if (IsDisposed || Disposing) return;
+        if (IsInactive) return;
 
         EnsureTaskbarHandle();
         LoadLayoutSwitchHotkeysFromWindows();
@@ -1025,8 +1071,6 @@ internal sealed class OverlayForm : Form
         }
         base.Dispose(disposing);
 
-        if (_exiting)
-            Application.ExitThread();
     }
 
     // ---- Rendering helpers ----
@@ -1242,7 +1286,7 @@ internal sealed class OverlayForm : Form
 
     private IntPtr KeyboardHookProc(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (_exiting || _hwnd == IntPtr.Zero)
+        if (_hwnd == IntPtr.Zero)
             return CallNextHookEx(_kbdHook, nCode, wParam, lParam);
 
         if (nCode >= 0)
@@ -1257,7 +1301,7 @@ internal sealed class OverlayForm : Form
                 if (IsLikelyLayoutSwitchKeyOnKeyUp(vk))
                 {
                     if (Interlocked.Exchange(ref _langCheckPending, 1) == 0)
-                        PostMessage(_hwnd, WM_APP_CHECK_LANG, IntPtr.Zero, IntPtr.Zero);
+                        PostMessage(_hwnd, WmAppCheckLang, IntPtr.Zero, IntPtr.Zero);
                 }
             }
         }
@@ -1382,169 +1426,4 @@ internal sealed class OverlayForm : Form
         return false;
     }
 
-    #region Win32
-
-    // Shell hook codes
-    private const int HSHELL_WINDOWACTIVATED = 4;
-    private const int HSHELL_RUDEAPPACTIVATED = 0x8004;
-
-    // AppBar
-    private const int ABM_NEW = 0x00000000;
-    private const int ABM_REMOVE = 0x00000001;
-    private const int ABN_FULLSCREENAPP = 0x00000002;
-
-    // Low-level keyboard
-    private const int WH_KEYBOARD_LL = 13;
-    private const int WM_KEYUP = 0x0101;
-    private const int WM_SYSKEYUP = 0x0105;
-
-    // VK codes
-    private const int VK_LSHIFT = 0xA0;
-    private const int VK_RSHIFT = 0xA1;
-    private const int VK_LCONTROL = 0xA2;
-    private const int VK_RCONTROL = 0xA3;
-    private const int VK_LMENU = 0xA4; // Alt
-    private const int VK_RMENU = 0xA5; // Alt
-
-    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool RegisterShellHookWindow(IntPtr hwnd);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool DeregisterShellHookWindow(IntPtr hwnd);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern int RegisterWindowMessage(string lpString);
-
-    [DllImport("shell32.dll", SetLastError = true)]
-    private static extern IntPtr SHAppBarMessage(int dwMessage, ref APPBARDATA pData);
-
-    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern IntPtr FindWindow(string lpClassName, string? lpWindowName);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
-
-    [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetKeyboardLayout(uint idThread);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
-        int x, int y, int cx, int cy, uint uFlags);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool IsWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern uint GetDpiForWindow(IntPtr hwnd);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    private static extern short GetAsyncKeyState(int vKey);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr GetModuleHandle(string? lpModuleName);
-
-    private const uint SWP_NOSIZE = 0x0001;
-    private const uint SWP_NOMOVE = 0x0002;
-    private const uint SWP_NOACTIVATE = 0x0010;
-
-    // Layered window
-    private const int ULW_ALPHA = 0x00000002;
-    private const byte AC_SRC_OVER = 0x00;
-    private const byte AC_SRC_ALPHA = 0x01;
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst,
-        ref POINT pptDst, ref SIZE psize, IntPtr hdcSrc, ref POINT pptSrc,
-        int crKey, ref BLENDFUNCTION pblend, int dwFlags);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetDC(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
-
-    [DllImport("gdi32.dll")]
-    private static extern IntPtr CreateCompatibleDC(IntPtr hDC);
-
-    [DllImport("gdi32.dll")]
-    private static extern bool DeleteDC(IntPtr hdc);
-
-    [DllImport("gdi32.dll")]
-    private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hgdiobj);
-
-    [DllImport("gdi32.dll")]
-    private static extern bool DeleteObject(IntPtr hObject);
-
-    [DllImport("kernel32.dll", SetLastError = false)]
-    private static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS sps);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct SYSTEM_POWER_STATUS
-    {
-        public byte ACLineStatus;        // 0=Offline, 1=Online, 255=Unknown
-        public byte BatteryFlag;         // 128=No battery
-        public byte BatteryLifePercent;  // 0-100, 255=Unknown
-        public byte SystemStatusFlag;
-        public int BatteryLifeTime;
-        public int BatteryFullLifeTime;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct APPBARDATA
-    {
-        public uint cbSize;
-        public IntPtr hWnd;
-        public uint uCallbackMessage;
-        public uint uEdge;
-        public RECT rc;
-        public IntPtr lParam;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct RECT { public int Left, Top, Right, Bottom; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct POINT
-    {
-        public int X, Y;
-        public POINT(int x, int y) { X = x; Y = y; }
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct SIZE
-    {
-        public int cx, cy;
-        public SIZE(int x, int y) { cx = x; cy = y; }
-    }
-
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    private struct BLENDFUNCTION
-    {
-        public byte BlendOp;
-        public byte BlendFlags;
-        public byte SourceConstantAlpha;
-        public byte AlphaFormat;
-    }
-
-    #endregion
 }
