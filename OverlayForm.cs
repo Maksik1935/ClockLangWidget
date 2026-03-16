@@ -486,9 +486,17 @@ internal sealed class OverlayForm : Form
         var now = DateTime.Now;
         _timeText = now.ToString("HH:mm");
         _dateText = now.ToString("dd.MM.yyyy");
+        bool oldHas = _hasBattery;
+        RefreshBattery();
 
-        // Батарейку в минутном тике НЕ опрашиваем (только по событию)
-        RenderOnly(force: false);
+        if (oldHas != _hasBattery)
+        {
+            RecalculateLayoutAndRender(forceRender: false);
+        }
+        else
+        {
+            RenderOnly(force: false);
+        }
     }
 
     private void RefreshAll(bool force)
