@@ -7,7 +7,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
-
+using System.ComponentModel;
 using WinFormsTimer = System.Windows.Forms.Timer;
 
 namespace ClockLangWidget;
@@ -17,9 +17,9 @@ internal sealed class OverlayForm : Form
     // --- Tunables ---
     private const float UiScaleBase = 0.60f;
 
-    // Lang sync: быстрый первый опрос + один ретрай, если не изменилось
-    private const int LangSyncDelayFastMs = 100;
-    private const int LangSyncDelayRetryMs = 160;
+    // Lang sync
+    private const int LangSyncRetryMs = 50;
+    private const int LangSyncMaxAttempts = 5;
 
     // Battery: 5 сегментов = шаг 20%
     private const int BatterySegments = 5;
@@ -47,17 +47,13 @@ internal sealed class OverlayForm : Form
     private int _appBarCallbackMsg;
     private bool _appBarRegistered;
 
-    // Low-level keyboard hook (ловим попытку переключения раскладки хоткеями)
-    private IntPtr _kbdHook = IntPtr.Zero;
-    private LowLevelKeyboardProc? _kbdProc;
-    private int _langCheckPending; // 0/1 — чтобы не спамить PostMessage
-    private const int WM_APP_CHECK_LANG = 0x8000 + 0x55;
-
     // HWND кешируем отдельно, чтобы из hook’а не трогать Handle при Dispose
     private IntPtr _hwnd = IntPtr.Zero;
 
     // Lang sync attempts
     private int _langSyncAttempt;
+
+    private int _lastRawTriggerTick;
 
     // Hover hide state
     private bool _hiddenByHover;
@@ -70,8 +66,8 @@ internal sealed class OverlayForm : Form
 
     // Battery runtime (простая логика)
     private bool _hasBattery;
-    private bool _acOnline;   // штекер воткнут => рисуем молнию
-    private int _batSteps;    // 0..BatterySegments
+    private bool _acOnline; // штекер воткнут => рисуем молнию
+    private int _batSteps; // 0..BatterySegments
 
     // Layout helpers (computed in EnsureSizeForTextWorstCase)
     private int _leftInsetPx;
@@ -180,7 +176,7 @@ internal sealed class OverlayForm : Form
         RebuildMetricsAndFonts();
         EnsureTaskbarHandle();
 
-        // сузим, какие хоткеи реально включены в системе (опционально, но полезно)
+        // сузим, какие хоткеи реально включены в системе
         LoadLayoutSwitchHotkeysFromWindows();
 
         // Shell hook: ловим смену активного окна
@@ -191,9 +187,8 @@ internal sealed class OverlayForm : Form
         _appBarCallbackMsg = RegisterWindowMessage("ClockLangWidget.AppBarCallback");
         RegisterAppBarCallback();
 
-        // Low-level keyboard hook
-        _kbdProc = KeyboardHookProc;
-        _kbdHook = InstallKeyboardHook(_kbdProc);
+        // Raw Input keyboard
+        RegisterKeyboardRawInput();
 
         // стартовый текст
         var now = DateTime.Now;
@@ -217,11 +212,24 @@ internal sealed class OverlayForm : Form
 
     protected override void OnHandleDestroyed(EventArgs e)
     {
-        try { UnregisterAppBarCallback(); } catch { }
+        try
+        {
+            UnregisterAppBarCallback();
+        }
+        catch
+        {
+        }
 
         if (_shellHookRegistered)
         {
-            try { DeregisterShellHookWindow(Handle); } catch { }
+            try
+            {
+                DeregisterShellHookWindow(Handle);
+            }
+            catch
+            {
+            }
+
             _shellHookRegistered = false;
         }
 
@@ -236,9 +244,17 @@ internal sealed class OverlayForm : Form
         const int WM_NCHITTEST = 0x0084;
         const int HTTRANSPARENT = -1;
 
+        if (m.Msg == WM_INPUT)
+        {
+            System.Diagnostics.Debug.WriteLine("WM_INPUT arrived");
+            HandleRawKeyboardInput(m.LParam);
+            base.WndProc(ref m);
+            return;
+        }
+
         if (m.Msg == WM_DPICHANGED)
         {
-            base.WndProc(ref m);   // сначала применить suggested rect / внутреннюю логику WinForms
+            base.WndProc(ref m);
 
             UpdateScaleFromDpi();
             RebuildMetricsAndFonts();
@@ -249,19 +265,18 @@ internal sealed class OverlayForm : Form
         // Hover hide + click-through
         if (m.Msg == WM_NCHITTEST)
         {
-            // всегда пропускаем мышь “сквозь”
             m.Result = (IntPtr)HTTRANSPARENT;
 
-            // скрываем только если видимы и реально под курсором
             if (!_hiddenByFullscreen && !_hiddenByHover && Visible)
             {
                 if (Bounds.Contains(Cursor.Position))
                     StartFadeTo(0, hideWhenDone: true);
             }
+
             return;
         }
 
-        // AppBar callback: появилось/пропало полноэкранное приложение
+        // AppBar callback
         if (_appBarCallbackMsg != 0 && m.Msg == _appBarCallbackMsg)
         {
             if (m.WParam.ToInt32() == ABN_FULLSCREENAPP)
@@ -269,7 +284,7 @@ internal sealed class OverlayForm : Form
             return;
         }
 
-        // Shell hook: смена активного окна
+        // Shell hook
         if (_shellHookMsg != 0 && m.Msg == _shellHookMsg)
         {
             int code = m.WParam.ToInt32();
@@ -280,23 +295,14 @@ internal sealed class OverlayForm : Form
             return;
         }
 
-        // Из keyboard hook: “похоже на переключение раскладки”
-        if (m.Msg == WM_APP_CHECK_LANG)
-        {
-            Interlocked.Exchange(ref _langCheckPending, 0);
-            RequestLangSyncAfterHotkey();
-            base.WndProc(ref m);
-            return;
-        }
-
         base.WndProc(ref m);
     }
 
     private void MinuteTimerTick(object? sender, EventArgs e)
     {
-        _minuteTimer.Stop();          // один тик -> один пересчёт
-        RefreshMinuteTick();          // код обновления текста + RenderOnly
-        ScheduleNextMinuteTick();     // снова ровно до следующей минуты
+        _minuteTimer.Stop(); // один тик -> один пересчёт
+        RefreshMinuteTick(); // код обновления текста + RenderOnly
+        ScheduleNextMinuteTick(); // снова ровно до следующей минуты
     }
 
     private void ComputeLangFixedWidth()
@@ -348,7 +354,7 @@ internal sealed class OverlayForm : Form
         _timeText = now.ToString("HH:mm");
         _dateText = now.ToString("dd.MM.yyyy");
         _langText = GetActiveKeyboardLayoutShort();
-        RefreshBattery();          // если батарейка рисуется — тоже актуализируем
+        RefreshBattery(); // если батарейка рисуется — тоже актуализируем
         RenderIfNeeded(force: false); // обновит _cachedHBitmap
 
         // плавно показываем
@@ -444,6 +450,7 @@ internal sealed class OverlayForm : Form
             StartFadeTo(255, hideWhenDone: false);
             return;
         }
+
         if (!_fadingToHidden && hovered)
         {
             StartFadeTo(0, hideWhenDone: true);
@@ -573,7 +580,14 @@ internal sealed class OverlayForm : Form
 
         if (InvokeRequired)
         {
-            try { BeginInvoke(new Action(OnPowerModeChangedUi)); } catch { }
+            try
+            {
+                BeginInvoke(new Action(OnPowerModeChangedUi));
+            }
+            catch
+            {
+            }
+
             return;
         }
 
@@ -608,7 +622,7 @@ internal sealed class OverlayForm : Form
 
         _langSyncAttempt = 0;
         _langSyncTimer.Stop();
-        _langSyncTimer.Interval = LangSyncDelayFastMs;
+        _langSyncTimer.Interval = LangSyncRetryMs;
         _langSyncTimer.Start();
     }
 
@@ -625,16 +639,117 @@ internal sealed class OverlayForm : Form
             return;
         }
 
-        // Не изменилось — один ретрай
-        if (_langSyncAttempt++ == 0)
+        // До 5 проверок по 50 мс после триггера
+        _langSyncAttempt++;
+        if (_langSyncAttempt < LangSyncMaxAttempts)
         {
-            _langSyncTimer.Interval = LangSyncDelayRetryMs;
+            _langSyncTimer.Interval = LangSyncRetryMs;
             _langSyncTimer.Start();
             return;
         }
 
         EnsureBehindTaskbar();
     }
+
+    private void RegisterKeyboardRawInput()
+{
+    var rid = new[]
+    {
+        new RAWINPUTDEVICE
+        {
+            usUsagePage = 0x01,          // Generic Desktop Controls
+            usUsage = 0x06,              // Keyboard
+            dwFlags = RIDEV_INPUTSINK,   // получать и в фоне
+            hwndTarget = Handle
+        }
+    };
+
+    if (!RegisterRawInputDevices(rid, (uint)rid.Length, (uint)Marshal.SizeOf<RAWINPUTDEVICE>()))
+        throw new Win32Exception(Marshal.GetLastWin32Error(), "RegisterRawInputDevices failed.");
+}
+
+private void HandleRawKeyboardInput(IntPtr hRawInput)
+{
+    uint size = 0;
+    uint headerSize = (uint)Marshal.SizeOf<RAWINPUTHEADER>();
+
+    // Первый вызов: узнать размер буфера
+    uint probe = GetRawInputData(hRawInput, RID_INPUT, IntPtr.Zero, ref size, headerSize);
+    if (probe != 0 || size == 0)
+        return;
+
+    IntPtr buffer = Marshal.AllocHGlobal((int)size);
+    try
+    {
+        uint read = GetRawInputData(hRawInput, RID_INPUT, buffer, ref size, headerSize);
+        if (read == 0xFFFFFFFF)
+            return;
+
+        var header = Marshal.PtrToStructure<RAWINPUTHEADER>(buffer);
+        if (header.dwType != RIM_TYPEKEYBOARD)
+            return;
+
+        IntPtr kbPtr = IntPtr.Add(buffer, Marshal.SizeOf<RAWINPUTHEADER>());
+        var kb = Marshal.PtrToStructure<RAWKEYBOARD>(kbPtr);
+
+        ProcessRawKeyboard(kb);
+    }
+    finally
+    {
+        Marshal.FreeHGlobal(buffer);
+    }
+}
+
+private const ushort KEYBOARD_OVERRUN_MAKE_CODE = 0xFF;
+private const ushort RI_KEY_BREAK = 0x0001;
+
+private void ProcessRawKeyboard(RAWKEYBOARD kb)
+{
+    // Мусор/переполнение клавиатуры игнорируем
+    if (kb.MakeCode == KEYBOARD_OVERRUN_MAKE_CODE || kb.VKey >= 0xFF)
+        return;
+
+    // Триггер только на нажатии, как и хотел
+    bool isDown = (kb.Flags & RI_KEY_BREAK) == 0;
+    if (!isDown)
+        return;
+
+    int vk = kb.VKey;
+
+    bool relevant = false;
+
+    // Alt участвует только если включён Alt+Shift
+    if (_watchAltShift &&
+        (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU))
+    {
+        relevant = true;
+    }
+
+    // Ctrl участвует только если включён Ctrl+Shift
+    if (_watchCtrlShift &&
+        (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL))
+    {
+        relevant = true;
+    }
+
+    // Shift участвует в обеих комбинациях
+    if ((_watchAltShift || _watchCtrlShift) &&
+        (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT))
+    {
+        relevant = true;
+    }
+
+    if (!relevant)
+        return;
+
+    // Небольшой debounce, чтобы не стартовать 10 таймеров подряд
+    int now = Environment.TickCount;
+    if (unchecked(now - _lastRawTriggerTick) < 120)
+        return;
+
+    _lastRawTriggerTick = now;
+    RequestLangSyncAfterHotkey();
+}
 
     // --- Battery state (AC online => молния) ---
 
@@ -684,7 +799,6 @@ internal sealed class OverlayForm : Form
                 _batSteps = BatterySegments;
         }
     }
-
 
 
     // --- Layout + render (редко) ---
@@ -771,8 +885,10 @@ internal sealed class OverlayForm : Form
                 rcBat = new Rectangle(batX, batY, _batIconW, _batIconH);
             }
 
-            using var sfRight = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
-            using var sfLeft = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
+            using var sfRight = new StringFormat
+                { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
+            using var sfLeft = new StringFormat
+                { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
 
             DrawTextModern(g, _langText, _fontLang!, rcLang, sfLeft,
                 shadowAlpha: 115, outlineAlpha: 55, outlineWidth: 1.05f * _scale, shadowOffset: 1.1f * _scale);
@@ -914,7 +1030,9 @@ internal sealed class OverlayForm : Form
                 uint dpi = GetDpiForWindow(Handle);
                 if (dpi >= 96) dpiScale = dpi / 96f;
             }
-            catch { }
+            catch
+            {
+            }
         }
 
         if (dpiScale <= 0.1f) dpiScale = 1f;
@@ -969,8 +1087,14 @@ internal sealed class OverlayForm : Form
 
         if (InvokeRequired)
         {
-            try { BeginInvoke(new Action(OnSystemChangedUi)); }
-            catch { }
+            try
+            {
+                BeginInvoke(new Action(OnSystemChangedUi));
+            }
+            catch
+            {
+            }
+
             return;
         }
 
@@ -998,26 +1122,64 @@ internal sealed class OverlayForm : Form
             SystemEvents.UserPreferenceChanged -= OnSystemChanged;
             SystemEvents.PowerModeChanged -= OnPowerModeChanged;
 
-            try { _minuteTimer.Stop(); _minuteTimer.Dispose(); } catch { }
-            try { _langSyncTimer.Stop(); _langSyncTimer.Dispose(); } catch { }
-            try { _hoverTimer.Stop(); _hoverTimer.Dispose(); } catch { }
-            try { _fadeTimer.Stop(); _fadeTimer.Dispose(); } catch { }
+            try
+            {
+                _minuteTimer.Stop();
+                _minuteTimer.Dispose();
+            }
+            catch
+            {
+            }
 
-            try { UnregisterAppBarCallback(); } catch { }
+            try
+            {
+                _langSyncTimer.Stop();
+                _langSyncTimer.Dispose();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                _hoverTimer.Stop();
+                _hoverTimer.Dispose();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                _fadeTimer.Stop();
+                _fadeTimer.Dispose();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                UnregisterAppBarCallback();
+            }
+            catch
+            {
+            }
 
             // Сначала делаем hwnd недоступным для hook’а
             _hwnd = IntPtr.Zero;
 
-            if (_kbdHook != IntPtr.Zero)
-            {
-                try { UnhookWindowsHookEx(_kbdHook); } catch { }
-                _kbdHook = IntPtr.Zero;
-                _kbdProc = null;
-            }
 
             if (_shellHookRegistered)
             {
-                try { DeregisterShellHookWindow(Handle); } catch { }
+                try
+                {
+                    DeregisterShellHookWindow(Handle);
+                }
+                catch
+                {
+                }
+
                 _shellHookRegistered = false;
             }
 
@@ -1028,9 +1190,17 @@ internal sealed class OverlayForm : Form
 
         if (_cachedHBitmap != IntPtr.Zero)
         {
-            try { DeleteObject(_cachedHBitmap); } catch { }
+            try
+            {
+                DeleteObject(_cachedHBitmap);
+            }
+            catch
+            {
+            }
+
             _cachedHBitmap = IntPtr.Zero;
         }
+
         base.Dispose(disposing);
 
         if (_exiting)
@@ -1058,11 +1228,11 @@ internal sealed class OverlayForm : Form
         }
 
         using (var pen = new Pen(Color.FromArgb(outlineAlpha, 0, 0, 0), outlineWidth)
-        {
-            LineJoin = LineJoin.Round,
-            StartCap = LineCap.Round,
-            EndCap = LineCap.Round
-        })
+               {
+                   LineJoin = LineJoin.Round,
+                   StartCap = LineCap.Round,
+                   EndCap = LineCap.Round
+               })
         {
             g.DrawPath(pen, path);
         }
@@ -1181,9 +1351,15 @@ internal sealed class OverlayForm : Form
     {
         foreach (var name in preferredNames)
         {
-            try { return new Font(name, size, style, GraphicsUnit.Point); }
-            catch { }
+            try
+            {
+                return new Font(name, size, style, GraphicsUnit.Point);
+            }
+            catch
+            {
+            }
         }
+
         return new Font("Segoe UI", size, style, GraphicsUnit.Point);
     }
 
@@ -1244,66 +1420,6 @@ internal sealed class OverlayForm : Form
             DeleteDC(memDc);
             ReleaseDC(IntPtr.Zero, screenDc);
         }
-    }
-
-    // ---- Keyboard hook (filtered) ----
-
-    private IntPtr KeyboardHookProc(int nCode, IntPtr wParam, IntPtr lParam)
-    {
-        if (_exiting || _hwnd == IntPtr.Zero)
-            return CallNextHookEx(_kbdHook, nCode, wParam, lParam);
-
-        if (nCode >= 0)
-        {
-            int msg = wParam.ToInt32();
-
-            // Реакция на KEYUP: переключение чаще всего происходит на отпускании
-            if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
-            {
-                int vk = Marshal.ReadInt32(lParam); // vkCode из KBDLLHOOKSTRUCT (первое поле)
-
-                if (IsLikelyLayoutSwitchKeyOnKeyUp(vk))
-                {
-                    if (Interlocked.Exchange(ref _langCheckPending, 1) == 0)
-                        PostMessage(_hwnd, WM_APP_CHECK_LANG, IntPtr.Zero, IntPtr.Zero);
-                }
-            }
-        }
-
-        return CallNextHookEx(_kbdHook, nCode, wParam, lParam);
-    }
-
-    private bool IsLikelyLayoutSwitchKeyOnKeyUp(int vk)
-    {
-        // Win+Space — не отслеживаем
-
-        if (_watchAltShift)
-        {
-            if ((vk == VK_LSHIFT || vk == VK_RSHIFT) && (IsDown(VK_LMENU) || IsDown(VK_RMENU)))
-                return true;
-
-            if ((vk == VK_LMENU || vk == VK_RMENU) && (IsDown(VK_LSHIFT) || IsDown(VK_RSHIFT)))
-                return true;
-        }
-
-        if (_watchCtrlShift)
-        {
-            if ((vk == VK_LSHIFT || vk == VK_RSHIFT) && (IsDown(VK_LCONTROL) || IsDown(VK_RCONTROL)))
-                return true;
-
-            if ((vk == VK_LCONTROL || vk == VK_RCONTROL) && (IsDown(VK_LSHIFT) || IsDown(VK_RSHIFT)))
-                return true;
-        }
-
-        return false;
-    }
-
-    private static bool IsDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
-
-    private static IntPtr InstallKeyboardHook(LowLevelKeyboardProc proc)
-    {
-        IntPtr hMod = GetModuleHandle(null);
-        return SetWindowsHookEx(WH_KEYBOARD_LL, proc, hMod, 0);
     }
 
     // --- Read configured hotkeys from Windows (optional narrowing) ---
@@ -1401,11 +1517,6 @@ internal sealed class OverlayForm : Form
     private const int ABM_REMOVE = 0x00000001;
     private const int ABN_FULLSCREENAPP = 0x00000002;
 
-    // Low-level keyboard
-    private const int WH_KEYBOARD_LL = 13;
-    private const int WM_KEYUP = 0x0101;
-    private const int WM_SYSKEYUP = 0x0105;
-
     // VK codes
     private const int VK_LSHIFT = 0xA0;
     private const int VK_RSHIFT = 0xA1;
@@ -1414,7 +1525,6 @@ internal sealed class OverlayForm : Form
     private const int VK_LMENU = 0xA4; // Alt
     private const int VK_RMENU = 0xA5; // Alt
 
-    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool RegisterShellHookWindow(IntPtr hwnd);
@@ -1453,24 +1563,6 @@ internal sealed class OverlayForm : Form
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint GetDpiForWindow(IntPtr hwnd);
 
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    private static extern short GetAsyncKeyState(int vKey);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr GetModuleHandle(string? lpModuleName);
-
     private const uint SWP_NOSIZE = 0x0001;
     private const uint SWP_NOMOVE = 0x0002;
     private const uint SWP_NOACTIVATE = 0x0010;
@@ -1479,6 +1571,63 @@ internal sealed class OverlayForm : Form
     private const int ULW_ALPHA = 0x00000002;
     private const byte AC_SRC_OVER = 0x00;
     private const byte AC_SRC_ALPHA = 0x01;
+
+    private const int WM_INPUT = 0x00FF;
+    private const int WM_KEYDOWN = 0x0100;
+    private const int WM_KEYUP = 0x0101;
+    private const int WM_SYSKEYDOWN = 0x0104;
+    private const int WM_SYSKEYUP = 0x0105;
+
+    private const uint RIDEV_INPUTSINK = 0x00000100;
+    private const uint RID_INPUT = 0x10000003;
+    private const uint RIM_TYPEKEYBOARD = 1;
+
+    private const int VK_SHIFT = 0x10;
+    private const int VK_CONTROL = 0x11;
+    private const int VK_MENU = 0x12;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterRawInputDevices(
+        [In] RAWINPUTDEVICE[] pRawInputDevices,
+        uint uiNumDevices,
+        uint cbSize);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUTDEVICE
+    {
+        public ushort usUsagePage;
+        public ushort usUsage;
+        public uint dwFlags;
+        public IntPtr hwndTarget;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUTHEADER
+    {
+        public uint dwType;
+        public uint dwSize;
+        public IntPtr hDevice;
+        public IntPtr wParam;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWKEYBOARD
+    {
+        public ushort MakeCode;
+        public ushort Flags;
+        public ushort Reserved;
+        public ushort VKey;
+        public uint Message;
+        public uint ExtraInformation;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetRawInputData(
+        IntPtr hRawInput,
+        uint uiCommand,
+        IntPtr pData,
+        ref uint pcbSize,
+        uint cbSizeHeader);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst,
@@ -1509,9 +1658,9 @@ internal sealed class OverlayForm : Form
     [StructLayout(LayoutKind.Sequential)]
     private struct SYSTEM_POWER_STATUS
     {
-        public byte ACLineStatus;        // 0=Offline, 1=Online, 255=Unknown
-        public byte BatteryFlag;         // 128=No battery
-        public byte BatteryLifePercent;  // 0-100, 255=Unknown
+        public byte ACLineStatus; // 0=Offline, 1=Online, 255=Unknown
+        public byte BatteryFlag; // 128=No battery
+        public byte BatteryLifePercent; // 0-100, 255=Unknown
         public byte SystemStatusFlag;
         public int BatteryLifeTime;
         public int BatteryFullLifeTime;
@@ -1529,20 +1678,33 @@ internal sealed class OverlayForm : Form
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct RECT { public int Left, Top, Right, Bottom; }
+    private struct RECT
+    {
+        public int Left, Top, Right, Bottom;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT
     {
         public int X, Y;
-        public POINT(int x, int y) { X = x; Y = y; }
+
+        public POINT(int x, int y)
+        {
+            X = x;
+            Y = y;
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SIZE
     {
         public int cx, cy;
-        public SIZE(int x, int y) { cx = x; cy = y; }
+
+        public SIZE(int x, int y)
+        {
+            cx = x;
+            cy = y;
+        }
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
