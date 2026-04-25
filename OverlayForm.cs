@@ -20,6 +20,7 @@ internal sealed class OverlayForm : Form
     // Lang sync
     private const int LangSyncRetryMs = 50;
     private const int LangSyncMaxAttempts = 5;
+    private const int LangSyncAfterReleaseMs = 90;
 
     // Battery: 5 сегментов = шаг 20%
     private const int BatterySegments = 5;
@@ -53,7 +54,10 @@ internal sealed class OverlayForm : Form
     // Lang sync attempts
     private int _langSyncAttempt;
 
-    private int _lastRawTriggerTick;
+    // Raw Input: какая комбинация смены раскладки была реально зажата.
+    // Sync запускаем после отпускания любой клавиши из этой комбинации.
+    private bool _altShiftComboArmed;
+    private bool _ctrlShiftComboArmed;
 
     // Hover hide state
     private bool _hiddenByHover;
@@ -534,7 +538,6 @@ internal sealed class OverlayForm : Form
         if (_hiddenByHover || _hiddenByFullscreen) return; // пока скрыты — не тратим CPU на UpdateLayered
 
         RenderIfNeeded(force);
-        EnsureBehindTaskbar();
     }
 
     private void RegisterAppBarCallback()
@@ -626,6 +629,16 @@ internal sealed class OverlayForm : Form
         _langSyncTimer.Start();
     }
 
+    private void RequestLangSyncAfterHotkeyRelease()
+    {
+        if (IsDisposed || Disposing) return;
+
+        _langSyncAttempt = 0;
+        _langSyncTimer.Stop();
+        _langSyncTimer.Interval = LangSyncAfterReleaseMs;
+        _langSyncTimer.Start();
+    }
+
     private void LangSyncTick()
     {
         _langSyncTimer.Stop();
@@ -652,104 +665,144 @@ internal sealed class OverlayForm : Form
     }
 
     private void RegisterKeyboardRawInput()
-{
-    var rid = new[]
     {
-        new RAWINPUTDEVICE
+        var rid = new[]
         {
-            usUsagePage = 0x01,          // Generic Desktop Controls
-            usUsage = 0x06,              // Keyboard
-            dwFlags = RIDEV_INPUTSINK,   // получать и в фоне
-            hwndTarget = Handle
+            new RAWINPUTDEVICE
+            {
+                usUsagePage = 0x01, // Generic Desktop Controls
+                usUsage = 0x06, // Keyboard
+                dwFlags = RIDEV_INPUTSINK, // получать и в фоне
+                hwndTarget = Handle
+            }
+        };
+
+        if (!RegisterRawInputDevices(rid, (uint)rid.Length, (uint)Marshal.SizeOf<RAWINPUTDEVICE>()))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "RegisterRawInputDevices failed.");
+    }
+
+    private void HandleRawKeyboardInput(IntPtr hRawInput)
+    {
+        uint size = 0;
+        uint headerSize = (uint)Marshal.SizeOf<RAWINPUTHEADER>();
+
+        // Первый вызов: узнать размер буфера
+        uint probe = GetRawInputData(hRawInput, RID_INPUT, IntPtr.Zero, ref size, headerSize);
+        if (probe != 0 || size == 0)
+            return;
+
+        IntPtr buffer = Marshal.AllocHGlobal((int)size);
+        try
+        {
+            uint read = GetRawInputData(hRawInput, RID_INPUT, buffer, ref size, headerSize);
+            if (read == 0xFFFFFFFF)
+                return;
+
+            var header = Marshal.PtrToStructure<RAWINPUTHEADER>(buffer);
+            if (header.dwType != RIM_TYPEKEYBOARD)
+                return;
+
+            IntPtr kbPtr = IntPtr.Add(buffer, Marshal.SizeOf<RAWINPUTHEADER>());
+            var kb = Marshal.PtrToStructure<RAWKEYBOARD>(kbPtr);
+
+            ProcessRawKeyboard(kb);
         }
-    };
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
 
-    if (!RegisterRawInputDevices(rid, (uint)rid.Length, (uint)Marshal.SizeOf<RAWINPUTDEVICE>()))
-        throw new Win32Exception(Marshal.GetLastWin32Error(), "RegisterRawInputDevices failed.");
-}
+    private const ushort KEYBOARD_OVERRUN_MAKE_CODE = 0xFF;
+    private const ushort RI_KEY_BREAK = 0x0001;
 
-private void HandleRawKeyboardInput(IntPtr hRawInput)
-{
-    uint size = 0;
-    uint headerSize = (uint)Marshal.SizeOf<RAWINPUTHEADER>();
-
-    // Первый вызов: узнать размер буфера
-    uint probe = GetRawInputData(hRawInput, RID_INPUT, IntPtr.Zero, ref size, headerSize);
-    if (probe != 0 || size == 0)
-        return;
-
-    IntPtr buffer = Marshal.AllocHGlobal((int)size);
-    try
+    private void ProcessRawKeyboard(RAWKEYBOARD kb)
     {
-        uint read = GetRawInputData(hRawInput, RID_INPUT, buffer, ref size, headerSize);
-        if (read == 0xFFFFFFFF)
+        // Мусор/переполнение клавиатуры игнорируем
+        if (kb.MakeCode == KEYBOARD_OVERRUN_MAKE_CODE || kb.VKey >= 0xFF)
             return;
 
-        var header = Marshal.PtrToStructure<RAWINPUTHEADER>(buffer);
-        if (header.dwType != RIM_TYPEKEYBOARD)
+        int vk = kb.VKey;
+
+        if (!IsLayoutSwitchModifier(vk))
             return;
 
-        IntPtr kbPtr = IntPtr.Add(buffer, Marshal.SizeOf<RAWINPUTHEADER>());
-        var kb = Marshal.PtrToStructure<RAWKEYBOARD>(kbPtr);
+        bool isDown = (kb.Flags & RI_KEY_BREAK) == 0;
 
-        ProcessRawKeyboard(kb);
+        if (isDown)
+        {
+            // На key-down ничего не синхронизируем.
+            // Только "вооружаем" комбинацию, если она реально сейчас зажата.
+
+            if (_watchAltShift && IsAltShiftDown())
+                _altShiftComboArmed = true;
+
+            if (_watchCtrlShift && IsCtrlShiftDown())
+                _ctrlShiftComboArmed = true;
+
+            return;
+        }
+
+        // Дальше только key-up.
+        // Запускаем sync после отпускания ЛЮБОЙ клавиши из вооружённой комбинации.
+
+        bool shouldSync = false;
+
+        if (_altShiftComboArmed && (IsAltKey(vk) || IsShiftKey(vk)))
+        {
+            _altShiftComboArmed = false;
+            shouldSync = true;
+        }
+
+        if (_ctrlShiftComboArmed && (IsCtrlKey(vk) || IsShiftKey(vk)))
+        {
+            _ctrlShiftComboArmed = false;
+            shouldSync = true;
+        }
+
+        if (shouldSync)
+            RequestLangSyncAfterHotkeyRelease();
     }
-    finally
+    private static bool IsLayoutSwitchModifier(int vk)
     {
-        Marshal.FreeHGlobal(buffer);
+        return IsShiftKey(vk) || IsAltKey(vk) || IsCtrlKey(vk);
     }
-}
 
-private const ushort KEYBOARD_OVERRUN_MAKE_CODE = 0xFF;
-private const ushort RI_KEY_BREAK = 0x0001;
-
-private void ProcessRawKeyboard(RAWKEYBOARD kb)
-{
-    // Мусор/переполнение клавиатуры игнорируем
-    if (kb.MakeCode == KEYBOARD_OVERRUN_MAKE_CODE || kb.VKey >= 0xFF)
-        return;
-
-    // Триггер только на нажатии, как и хотел
-    bool isDown = (kb.Flags & RI_KEY_BREAK) == 0;
-    if (!isDown)
-        return;
-
-    int vk = kb.VKey;
-
-    bool relevant = false;
-
-    // Alt участвует только если включён Alt+Shift
-    if (_watchAltShift &&
-        (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU))
+    private static bool IsShiftKey(int vk)
     {
-        relevant = true;
+        return vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT;
     }
 
-    // Ctrl участвует только если включён Ctrl+Shift
-    if (_watchCtrlShift &&
-        (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL))
+    private static bool IsAltKey(int vk)
     {
-        relevant = true;
+        return vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU;
     }
 
-    // Shift участвует в обеих комбинациях
-    if ((_watchAltShift || _watchCtrlShift) &&
-        (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT))
+    private static bool IsCtrlKey(int vk)
     {
-        relevant = true;
+        return vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL;
     }
 
-    if (!relevant)
-        return;
+    private static bool IsAltShiftDown()
+    {
+        bool shift = IsKeyDown(VK_SHIFT) || IsKeyDown(VK_LSHIFT) || IsKeyDown(VK_RSHIFT);
+        bool alt = IsKeyDown(VK_MENU) || IsKeyDown(VK_LMENU) || IsKeyDown(VK_RMENU);
 
-    // Небольшой debounce, чтобы не стартовать 10 таймеров подряд
-    int now = Environment.TickCount;
-    if (unchecked(now - _lastRawTriggerTick) < 120)
-        return;
+        return alt && shift;
+    }
 
-    _lastRawTriggerTick = now;
-    RequestLangSyncAfterHotkey();
-}
+    private static bool IsCtrlShiftDown()
+    {
+        bool shift = IsKeyDown(VK_SHIFT) || IsKeyDown(VK_LSHIFT) || IsKeyDown(VK_RSHIFT);
+        bool ctrl = IsKeyDown(VK_CONTROL) || IsKeyDown(VK_LCONTROL) || IsKeyDown(VK_RCONTROL);
+
+        return ctrl && shift;
+    }
+
+    private static bool IsKeyDown(int vk)
+    {
+        return (GetAsyncKeyState(vk) & 0x8000) != 0;
+    }
 
     // --- Battery state (AC online => молния) ---
 
@@ -1552,6 +1605,9 @@ private void ProcessRawKeyboard(RAWKEYBOARD kb)
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetKeyboardLayout(uint idThread);
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
