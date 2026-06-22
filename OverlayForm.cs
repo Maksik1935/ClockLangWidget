@@ -119,6 +119,7 @@ internal sealed class OverlayForm : Form
     private byte _fadeToAlpha;
     private bool _fading;
     private bool _fadingToHidden;
+    private int _taskbarCreatedMsg;
 
     private IntPtr _cachedHBitmap = IntPtr.Zero;
     private SIZE _cachedSize;
@@ -174,6 +175,7 @@ internal sealed class OverlayForm : Form
     {
         base.OnHandleCreated(e);
 
+
         _hwnd = Handle;
 
         UpdateScaleFromDpi();
@@ -182,6 +184,8 @@ internal sealed class OverlayForm : Form
 
         // сузим, какие хоткеи реально включены в системе
         LoadLayoutSwitchHotkeysFromWindows();
+
+        _taskbarCreatedMsg = RegisterWindowMessage("TaskbarCreated");
 
         // Shell hook: ловим смену активного окна
         _shellHookMsg = RegisterWindowMessage("SHELLHOOK");
@@ -280,6 +284,12 @@ internal sealed class OverlayForm : Form
             return;
         }
 
+        if (_taskbarCreatedMsg != 0 && m.Msg == _taskbarCreatedMsg)
+        {
+            RecoverShellRegistrations();
+            return;
+        }
+
         // AppBar callback
         if (_appBarCallbackMsg != 0 && m.Msg == _appBarCallbackMsg)
         {
@@ -300,6 +310,48 @@ internal sealed class OverlayForm : Form
         }
 
         base.WndProc(ref m);
+    }
+
+    private void RecoverShellRegistrations()
+    {
+        if (IsDisposed || Disposing || !IsHandleCreated || _hwnd == IntPtr.Zero)
+            return;
+
+        // HWND таскбара после перезапуска Explorer уже другой.
+        _taskbarHwnd = IntPtr.Zero;
+        EnsureTaskbarHandle();
+
+        // TaskbarCreated может приходить и без полного падения Explorer,
+        // поэтому сначала безопасно удаляем старую регистрацию.
+        try
+        {
+            UnregisterAppBarCallback();
+        }
+        catch
+        {
+            _appBarRegistered = false;
+        }
+
+        _appBarRegistered = false;
+        RegisterAppBarCallback();
+
+        // Shell hook тоже является регистрацией в Shell.
+        if (_shellHookRegistered)
+        {
+            try
+            {
+                DeregisterShellHookWindow(_hwnd);
+            }
+            catch
+            {
+            }
+
+            _shellHookRegistered = false;
+        }
+
+        _shellHookRegistered = RegisterShellHookWindow(_hwnd);
+
+        RecalculateLayoutAndRender(forceRender: true);
     }
 
     private void MinuteTimerTick(object? sender, EventArgs e)
